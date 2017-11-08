@@ -15,8 +15,71 @@
 namespace rx
 {
 
+namespace
+{
+
+egl::Error GetGLDescFromTex(ID3D11Texture2D *const tex,
+                            const UINT planeIndex,
+                            egl::Stream::GLTextureDescription *const out)
+{
+    if (!tex)
+        return egl::EglBadParameter() << "Texture is null";
+
+    D3D11_TEXTURE2D_DESC desc;
+    tex->GetDesc(&desc);
+
+    if (desc.Width < 1 || desc.Height < 1)
+        return egl::EglBadParameter() << "Width or height < 1";
+
+    out->width     = desc.Width;
+    out->height    = desc.Height;
+    out->mipLevels = 0;
+
+    UINT maxPlaneIndex = 0;
+    switch (desc.Format)
+    {
+        case DXGI_FORMAT_NV12:
+            // The UV plane of NV12 textures has half the width/height of the Y plane
+            if ((desc.Width % 2) != 0 || (desc.Height % 2) != 0)
+                return egl::EglBadParameter() << "NV12 tetxures must have even width and height.";
+
+            maxPlaneIndex = 1;
+            if (planeIndex == 0)
+            {
+                out->internalFormat = GL_R8;
+            }
+            else
+            {
+                out->internalFormat = GL_RG8;
+                out->width /= 2;
+                out->height /= 2;
+            }
+            break;
+
+        case DXGI_FORMAT_R8_UNORM:
+            out->internalFormat = GL_R8;
+            break;
+        case DXGI_FORMAT_R8G8_UNORM:
+            out->internalFormat = GL_RG8;
+            break;
+        case DXGI_FORMAT_R8G8B8A8_UNORM:
+            out->internalFormat = GL_RGBA8;
+            break;
+
+        default:
+            return egl::EglBadParameter() << "Unsupported format";
+    }
+
+    if (planeIndex > maxPlaneIndex)  // Just kidding, there's no plane out there.
+        return egl::EglBadParameter() << "Plane out of range";
+
+    return egl::NoError();
+}
+
+}  // namespace
+
 StreamProducerNV12::StreamProducerNV12(Renderer11 *renderer)
-    : mRenderer(renderer), mTexture(nullptr), mArraySlice(0), mTextureWidth(0), mTextureHeight(0)
+    : mRenderer(renderer), mTexture(nullptr), mArraySlice(0), mPlaneOffset(0)
 {
 }
 
@@ -25,7 +88,8 @@ StreamProducerNV12::~StreamProducerNV12()
     SafeRelease(mTexture);
 }
 
-egl::Error StreamProducerNV12::validateD3DNV12Texture(void *pointer) const
+egl::Error StreamProducerNV12::validateD3DNV12Texture(void *pointer,
+                                                      const egl::AttributeMap &attributes) const
 {
     ID3D11Texture2D *textureD3D = static_cast<ID3D11Texture2D *>(pointer);
 
@@ -37,22 +101,9 @@ egl::Error StreamProducerNV12::validateD3DNV12Texture(void *pointer) const
         return egl::EglBadParameter() << "Texture not created on ANGLE D3D device";
     }
 
-    // Get the description and validate it
-    D3D11_TEXTURE2D_DESC desc;
-    textureD3D->GetDesc(&desc);
-    if (desc.Format != DXGI_FORMAT_NV12)
-    {
-        return egl::EglBadParameter() << "Texture format not DXGI_FORMAT_NV12";
-    }
-    if (desc.Width < 1 || desc.Height < 1)
-    {
-        return egl::EglBadParameter() << "Texture is of size 0";
-    }
-    if ((desc.Width % 2) != 0 || (desc.Height % 2) != 0)
-    {
-        return egl::EglBadParameter() << "Texture dimensions are not even";
-    }
-    return egl::NoError();
+    const auto planeId = static_cast<UINT>(attributes.get(EGL_NATIVE_BUFFER_PLANE_OFFSET_IMG, 0));
+    egl::Stream::GLTextureDescription unused;
+    return GetGLDescFromTex(textureD3D, planeId, &unused);
 }
 
 void StreamProducerNV12::postD3DNV12Texture(void *pointer, const egl::AttributeMap &attributes)
@@ -60,33 +111,20 @@ void StreamProducerNV12::postD3DNV12Texture(void *pointer, const egl::AttributeM
     ASSERT(pointer != nullptr);
     ID3D11Texture2D *textureD3D = static_cast<ID3D11Texture2D *>(pointer);
 
-    // Check that the texture originated from our device
-    ID3D11Device *device;
-    textureD3D->GetDevice(&device);
-
-    // Get the description
-    D3D11_TEXTURE2D_DESC desc;
-    textureD3D->GetDesc(&desc);
-
     // Release the previous texture if there is one
     SafeRelease(mTexture);
 
     mTexture = textureD3D;
     mTexture->AddRef();
-    mTextureWidth  = desc.Width;
-    mTextureHeight = desc.Height;
-    mArraySlice    = static_cast<UINT>(attributes.get(EGL_D3D_TEXTURE_SUBRESOURCE_ID_ANGLE, 0));
+    mPlaneOffset = static_cast<UINT>(attributes.get(EGL_NATIVE_BUFFER_PLANE_OFFSET_IMG, 0));
+    mArraySlice  = static_cast<UINT>(attributes.get(EGL_D3D_TEXTURE_SUBRESOURCE_ID_ANGLE, 0));
 }
 
 egl::Stream::GLTextureDescription StreamProducerNV12::getGLFrameDescription(int planeIndex)
 {
-    // The UV plane of NV12 textures has half the width/height of the Y plane
-    egl::Stream::GLTextureDescription desc;
-    desc.width          = (planeIndex == 0) ? mTextureWidth : (mTextureWidth / 2);
-    desc.height         = (planeIndex == 0) ? mTextureHeight : (mTextureHeight / 2);
-    desc.internalFormat = (planeIndex == 0) ? GL_R8 : GL_RG8;
-    desc.mipLevels      = 0;
-    return desc;
+    egl::Stream::GLTextureDescription ret;
+    (void)GetGLDescFromTex(mTexture, static_cast<UINT>(planeIndex + mPlaneOffset), &ret);
+    return ret;
 }
 
 ID3D11Texture2D *StreamProducerNV12::getD3DTexture()
