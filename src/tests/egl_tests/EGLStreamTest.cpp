@@ -352,6 +352,288 @@ TEST_P(EGLStreamTest, StreamConsumerGLTextureYUVDeletionTest)
     ASSERT_EGL_SUCCESS();
 }
 
+ID3D11Texture2D *CreateD3D11TexNV12(ID3D11Device *const device, const UINT width,
+                                    const UINT height, const DXGI_FORMAT format,
+                                    const UINT slicePitch, const void *const data)
+{
+    ASSERT(width % 2 == 0);
+    ASSERT(height % 2 == 0);
+
+    // Create the NV12 D3D11 texture
+    D3D11_TEXTURE2D_DESC desc;
+    desc.Width              = width;
+    desc.Height             = height;
+    desc.Format             = format;
+    desc.MipLevels          = 1;
+    desc.ArraySize          = 1;
+    desc.SampleDesc.Count   = 1;
+    desc.SampleDesc.Quality = 0;
+    desc.Usage              = D3D11_USAGE_DEFAULT;
+    desc.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
+    desc.CPUAccessFlags     = 0;
+    desc.MiscFlags          = 0;
+
+    D3D11_SUBRESOURCE_DATA subres;
+    subres.pSysMem          = data;
+    subres.SysMemPitch      = width;
+    subres.SysMemSlicePitch = width * height;
+    if (format ==  * 3 / 2;
+
+    ID3D11Texture2D *texture = nullptr;
+    (void)device->CreateTexture2D(&desc, &subres, &texture);
+    return texture;
+}
+
+class D3D11TextureStreamSamplingTest : public ANGLETest
+{
+	EGLStreamKHR mStream;
+	GLRenderbuffer mRB;
+	GLFramebuffer mFB;
+	ID3D11Device *mD3D;
+
+    void SetUp() override
+    {
+        ANGLETest::SetUp();
+
+		EGLWindow *window = getEGLWindow();
+		mDisplay          = window->getDisplay();
+		if (!eglDisplayExtensionEnabled(mDisplay, "EGL_ANGLE_stream_producer_d3d_texture_nv12"))
+		{
+			std::cout << "Stream producer d3d nv12 texture not supported" << std::endl;
+			return;
+		}
+
+		glBindRenderbuffer(GL_RENDERBUFFER, mRB);
+		glRenderbufferStorage(GL_RENDERBUFFER, GL_RGBA8, 2, 2);
+		glBindRenderbuffer(GL_RENDERBUFFER, 0);
+
+		glBindFramebuffer(GL_FRAMEBUFFER, mFB);
+		glFramebufferRenderbuffer(GL_FRAMEBUFFER, GL_COLOR_ATTACHMENT0, GL_RENDERBUFFER, mRB);
+		ASSERT_GLENUM_EQ(GL_FRAMEBUFFER_COMPLETE, glCheckFramebufferStatus(GL_FRAMEBUFFER));
+
+		glViewport(0, 0, 2, 2);
+		glClearColor(1, 0, 0, 1);
+		glClear(GL_COLOR_BUFFER_BIT);
+		ASSERT_GL_NO_ERROR();
+
+		mStream = eglCreateStreamKHR(mDisplay, nullptr);
+        ASSERT_EGL_SUCCESS();
+
+		EGLDeviceEXT eglDevice;
+		eglQueryDisplayAttribEXT(mDisplay, EGL_DEVICE_EXT, (EGLAttrib *)&eglDevice);
+		eglQueryDeviceAttribEXT(eglDevice, EGL_D3D11_DEVICE_ANGLE, (EGLAttrib *)&mD3D);
+    }
+
+    void TearDown() override
+    {
+        EGLBoolean result = eglDestroyStreamKHR(mDisplay, mStream);
+		ASSERT_EGL_TRUE(result);
+        ASSERT_EGL_SUCCESS();
+
+        ANGLETest::TearDown();
+    }
+}
+
+// Test RGBA texture sampling via EGLStreams
+TEST_P(D3D11TextureStreamSamplingTest, RGBA)
+{
+    constexpr char kVertShader[] = R"(
+        attribute vec4 aPos;
+        varying vec2 vTexCoord;
+        void main()
+        {
+            gl_Position = aPos;
+            vTexCoord = gl_Position.xy * 0.5 + 0.5;
+        }
+    )";
+    constexpr char kFragShader[] = R"(
+        precision mediump float;
+        uniform sampler2D uTex;
+        varying vec2 vTexCoord;
+        void main()
+        {
+            gl_FragColor = texture2D(uTex, vTexCoord);
+        }
+    )";
+    ANGLE_GL_PROGRAM(prog, kVertShader, kFragShader);
+    glUseProgram(prog);
+    glUniform1i(glGetUniformLocation(prog, "uTex"), 0);
+
+    GLTexture tex;
+	glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    ASSERT_GL_NO_ERROR();
+
+	EGLBoolean result = eglStreamConsumerGLTextureExternalAttribsNV(display, stream, nullptr);
+	ASSERT_EGL_TRUE(result);
+	ASSERT_EGL_SUCCESS();
+	glActiveTexture(GL_TEXTURE3); // Set to an unused slot to ensure StreamConsumer picked up
+								  // the current slot.
+
+	result = eglCreateStreamProducerD3DTextureNV12ANGLE(display, stream, nullptr);
+	ASSERT_EGL_TRUE(result);
+	ASSERT_EGL_SUCCESS();
+
+	// Create and post the d3d11 texture
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width              = 1;
+	desc.Height             = 1;
+	desc.Format             = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.MipLevels          = 1;
+	desc.ArraySize          = 1;
+	desc.SampleDesc.Count   = 1;
+	desc.Usage              = D3D11_USAGE_DEFAULT;
+	desc.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
+
+	constexpr uint8_t texData[] = {
+		0x10, 0x20, 0x30, 0x40
+	};
+	D3D11_SUBRESOURCE_DATA subres;
+	subres.pSysMem          = texData;
+	subres.SysMemPitch      = 4;
+
+	ID3D11Texture2D *texture = nullptr;
+	(void)device->CreateTexture2D(&desc, &subres, &texture);
+	ASSERT_NE(texture, nullptr);
+
+	result = eglStreamPostD3DTextureNV12ANGLE(display, stream, (void *)texture, nullptr);
+	ASSERT_EGL_TRUE(result);
+	ASSERT_EGL_SUCCESS();
+
+	// Sample and test
+
+	result = eglStreamConsumerAcquireKHR(display, stream);
+	ASSERT_EGL_TRUE(result);
+	ASSERT_EGL_SUCCESS();
+
+	drawQuad(prog, "aPos", 0.0);
+
+	uint32_t pixel;
+	glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &pixel);
+	ASSERT_EQ(pixel, 0x40302010);
+
+	result = eglStreamConsumerReleaseKHR(display, stream);
+	ASSERT_EGL_TRUE(result);
+	ASSERT_EGL_SUCCESS();
+}
+
+// Test NV12 texture sampling via EGLStreams
+TEST_P(D3D11TextureStreamSamplingTest, NV12)
+{
+    constexpr char kVertShader[] = R"(
+        attribute vec4 aPos;
+        varying vec2 vTexCoord;
+        void main()
+        {
+            gl_Position = aPos;
+            vTexCoord = gl_Position.xy * 0.5 + 0.5;
+        }
+    )";
+    const char kFragShader[] = R"(
+        precision mediump float;
+        uniform sampler2D uTexY;
+        uniform sampler2D uTexUV;
+        varying vec2 vTexCoord;
+        void main()
+        {
+            gl_FragColor.r = texture2D(uTexY, vTexCoord).r;
+            gl_FragColor.gb = texture2D(uTexUV, vTexCoord).rg;
+            gl_FragColor.a = 1.0;
+        }
+    )";
+    ANGLE_GL_PROGRAM(prog, kVertShader, kFragShader);
+    glUseProgram(prog);
+    glUniform1i(glGetUniformLocation(prog, "uTexY"), 0);
+    glUniform1i(glGetUniformLocation(prog, "uTexUV"), 1);
+
+    ASSERT_GL_NO_ERROR();
+
+    GLTexture tex[2];
+    glActiveTexture(GL_TEXTURE0);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex[0]);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    ASSERT_GL_NO_ERROR();
+    glActiveTexture(GL_TEXTURE1);
+    glBindTexture(GL_TEXTURE_EXTERNAL_OES, tex[1]);
+    glTexParameteri(GL_TEXTURE_EXTERNAL_OES, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+    ASSERT_GL_NO_ERROR();
+
+	glActiveTexture(GL_TEXTURE3); // Set to an unused slot to ensure StreamConsumer picks up
+								  // the current slot.
+	constexpr EGLAttrib consumerAttributes[] = {
+		EGL_COLOR_BUFFER_TYPE,
+		EGL_YUV_BUFFER_EXT,
+		EGL_YUV_NUMBER_OF_PLANES_EXT,
+		2,
+		EGL_YUV_PLANE0_TEXTURE_UNIT_NV,
+		0,
+		EGL_YUV_PLANE1_TEXTURE_UNIT_NV,
+		1,
+		EGL_NONE,
+	};
+	EGLBoolean result = eglStreamConsumerGLTextureExternalAttribsNV(display, stream,
+																	consumerAttributes);
+	ASSERT_EGL_TRUE(result);
+	ASSERT_EGL_SUCCESS();
+
+	result = eglCreateStreamProducerD3DTextureNV12ANGLE(display, stream, nullptr);
+	ASSERT_EGL_TRUE(result);
+	ASSERT_EGL_SUCCESS();
+
+	// Create and post the d3d11 texture
+
+	D3D11_TEXTURE2D_DESC desc = {};
+	desc.Width              = 1;
+	desc.Height             = 1;
+	desc.Format             = DXGI_FORMAT_R8G8B8A8_UNORM;
+	desc.MipLevels          = 1;
+	desc.ArraySize          = 1;
+	desc.SampleDesc.Count   = 1;
+	desc.Usage              = D3D11_USAGE_DEFAULT;
+	desc.BindFlags          = D3D11_BIND_SHADER_RESOURCE;
+
+	constexpr uint8_t texData[] = {
+		0x10, 0x20, 0x30, 0x40, 0x50, 0x60
+	};
+	D3D11_SUBRESOURCE_DATA subres;
+	subres.pSysMem          = texData;
+	subres.SysMemPitch      = 2;
+
+	ID3D11Texture2D *texture = nullptr;
+	(void)device->CreateTexture2D(&desc, &subres, &texture);
+	ASSERT_NE(texture, nullptr);
+
+	result = eglStreamPostD3DTextureNV12ANGLE(display, stream, (void *)texture, nullptr);
+	ASSERT_EGL_TRUE(result);
+	ASSERT_EGL_SUCCESS();
+
+	// Sample and test
+
+	result = eglStreamConsumerAcquireKHR(display, stream);
+	ASSERT_EGL_TRUE(result);
+	ASSERT_EGL_SUCCESS();
+
+	drawQuad(prog, "aPos", 0.0);
+	uint32_t pixel;
+	glReadPixels(0, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &pixel);
+	ASSERT_EQ(pixel, 0xff605010);
+
+	glReadPixels(1, 0, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &pixel);
+	ASSERT_EQ(pixel, 0xff605020);
+
+	glReadPixels(0, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &pixel);
+	ASSERT_EQ(pixel, 0xff605030);
+
+	glReadPixels(1, 1, 1, 1, GL_RGBA, GL_UNSIGNED_BYTE, &pixel);
+	ASSERT_EQ(pixel, 0xff605040);
+
+	result = eglStreamConsumerReleaseKHR(display, stream);
+	ASSERT_EGL_TRUE(result);
+	ASSERT_EGL_SUCCESS();
+}
+
 // End2end test for rendering an NV12 texture. Renders a YUV quad, reads back the RGB values, and
 // ensures they are correct
 TEST_P(EGLStreamTest, StreamProducerTextureNV12End2End)
@@ -443,7 +725,6 @@ TEST_P(EGLStreamTest, StreamProducerTextureNV12End2End)
     eglQueryDeviceAttribEXT(eglDevice, EGL_D3D11_DEVICE_ANGLE, (EGLAttrib *)&device);
 
     // Create the NV12 D3D11 texture
-    HRESULT res;
     D3D11_TEXTURE2D_DESC desc;
     desc.Width              = yuvtest_width;
     desc.Height             = yuvtest_height;
@@ -463,7 +744,8 @@ TEST_P(EGLStreamTest, StreamProducerTextureNV12End2End)
     subres.SysMemSlicePitch = yuvtest_width * yuvtest_height * 3 / 2;
 
     ID3D11Texture2D *texture = nullptr;
-    res                      = device->CreateTexture2D(&desc, &subres, &texture);
+    (void)device->CreateTexture2D(&desc, &subres, &texture);
+    ASSERT_NE(texture, nullptr);
 
     // Create the stream
     const EGLint streamAttributes[] = {
@@ -544,4 +826,7 @@ ANGLE_INSTANTIATE_TEST(EGLStreamTest,
                        ES3_D3D11(),
                        ES2_OPENGL(),
                        ES3_OPENGL());
+ANGLE_INSTANTIATE_TEST(D3D11TextureStreamSamplingTest,
+                       ES2_D3D11(),
+                       ES3_D3D11());
 }  // anonymous namespace
